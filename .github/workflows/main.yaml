@@ -1,0 +1,106 @@
+on:
+  repository_dispatch:
+    types: [Gintaa]
+ 
+name: GCR | Sonarqube 
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_DEV }}
+  IMAGE: gintaa-api-test
+  PROFILE: dev
+  ENVIRONMENT: develop
+
+
+jobs:
+  gcr_push:
+    name: GCR Push Workflow 
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up JDK 11
+      uses: actions/setup-java@v1
+      with:
+        java-version: 11
+    - name: Create settings.xml file
+      run: |
+        mkdir -p $HOME/.m2
+        echo "${{ secrets.SETTINGS_XML_FILE_B64 }}" | base64 --decode > $HOME/.m2/settings.xml
+    - name: Cache Maven packages
+      uses: actions/cache@v2
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+    - name: Build and Package with Maven
+      run: mvn -B clean package
+    - uses: google-github-actions/setup-gcloud@v0.2.1
+      with:
+        service_account_key: ${{ secrets.GCP_SA_KEY_DEV }}
+        project_id: ${{ env.PROJECT_ID }}
+        export_default_credentials: true
+    - run: |-
+        gcloud components install docker-credential-gcr
+        gcloud --quiet auth configure-docker
+    - name: Generate build ID
+      id: prep
+      run: |
+          branch=dev
+          sha=${GITHUB_SHA::8}
+          ts=$(date +%Y%m%d%H%M%S)
+          echo "::set-output name=BUILD_ID::${branch}-${ts}-${sha}"
+    - name: Build docker
+      id: build
+      run: |-
+        GCR_IMAGE=gcr.io/$PROJECT_ID/$IMAGE:${{ steps.prep.outputs.BUILD_ID }}
+        mvn package jib:dockerBuild -Djib.to.image=$GCR_IMAGE -Djib.container.creationTime=USE_CURRENT_TIMESTAMP
+        echo "::set-output name=image::$GCR_IMAGE"
+    - name: Scan docker image
+      uses: docker://docker.io/aquasec/trivy:latest
+      with:
+          #args: --cache-dir /var/lib/trivy --no-progress --exit-code 1 --severity MEDIUM,HIGH,CRITICAL ${{ steps.build.outputs.image }}
+          args: --cache-dir /var/lib/trivy --no-progress --exit-code 0 --severity MEDIUM,HIGH,CRITICAL ${{ steps.build.outputs.image }}
+    # Push the Docker image to Google Container Registry
+    - name: Publish to GCR
+      run: |-
+        mvn package jib:build -Djib.to.image=${{ steps.build.outputs.image }} -Djib.container.creationTime=USE_CURRENT_TIMESTAMP -Djib.to.credHelper=gcr
+    - name: Notify Slack
+      uses: asconsoft/action-slack@v4.0.1
+      with:
+        channel: '#deployment'
+        if_mention: failure,cancelled
+        status: ${{ job.status }}
+        fields: workflow,job,commit,repo,ref,author
+        text_success: ':rocket: `gintaa-api-test|` is successfully pushed to :docker: <http://gcr.io/${{ env.PROJECT_ID }}/gintaa-api-test|*GCR*> :bookmark: `${{ steps.prep.outputs.BUILD_ID }}`; may be auto-deployed in :kubernetes: soon :v:'
+        text_failure: ':boom: `gintaa-api-test|` is not pushed to GCR due to some failures :-1:; working on it :hammer_and_wrench:'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # optional
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} # required
+      if: always() # Pick up events even if the job fails or is canceled.
+      
+  sonar_analyze:
+    name: Maven Sonarqube Analysis
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up JDK 11
+      uses: actions/setup-java@v1
+      with:
+        java-version: 11
+    - name: Create settings.xml file
+      run: |
+        mkdir -p $HOME/.m2
+        echo "${{ secrets.SETTINGS_XML_FILE_B64 }}" | base64 --decode > $HOME/.m2/settings.xml
+    - name: Cache Maven packages
+      uses: actions/cache@v2
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+    - name: Build and sonar analyze with Maven
+      run: |-
+        mvn -B clean jacoco:prepare-agent install jacoco:report sonar:sonar \
+        -Dsonar.branch.name=${GITHUB_REF#refs/heads/} \
+        -Dsonar.host.url=${{ secrets.SONARQUBE_HOST }} \
+        -Dsonar.login=${{ secrets.SONARQUBE_TOKEN }} \
+        -Dsonar.coverage.jacoco.xmlReportPaths=./target/site/jacoco/jacoco.xml
