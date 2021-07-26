@@ -1,6 +1,6 @@
 on:
   repository_dispatch:
-    types: [Gintaa]
+    types: [{{ secrets.POC_SECRET}}]
  
 name: GCR | Sonarqube 
 
