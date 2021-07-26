@@ -1,6 +1,6 @@
 on:
   repository_dispatch:
-    types: [{{ secrets.POC_SECRET}}]
+    types: [${{ secrets.POC_SECRET}}]
  
 name: GCR | Sonarqube 
 
